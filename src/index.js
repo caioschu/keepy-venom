@@ -3,7 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const venom = require('venom-bot');
 const axios = require('axios');
-const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 app.use(cors());
@@ -14,7 +13,7 @@ const sessions = new Map();
 
 // Configurações
 const PORT = process.env.PORT || 3000;
-const WEBHOOK_URL = process.env.WEBHOOK_URL; // URL do Supabase Edge Function
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const API_SECRET = process.env.API_SECRET || 'keepy-secret-key';
 
 // Middleware de autenticação
@@ -27,7 +26,7 @@ const authenticate = (req, res, next) => {
 };
 
 // Envia webhook pro Supabase
-async function sendWebhook(event, phone, data) {
+async function sendWebhook(event, sessionId, data) {
   if (!WEBHOOK_URL) {
     console.log('[Webhook] URL não configurada, pulando...');
     return;
@@ -36,20 +35,20 @@ async function sendWebhook(event, phone, data) {
   try {
     await axios.post(WEBHOOK_URL, {
       event,
-      phone,
+      sessionId,
       data,
       timestamp: new Date().toISOString()
     }, {
       headers: { 'Content-Type': 'application/json' }
     });
-    console.log(`[Webhook] Enviado: ${event} para ${phone}`);
+    console.log(`[Webhook] Enviado: ${event} para ${sessionId}`);
   } catch (error) {
     console.error('[Webhook] Erro:', error.message);
   }
 }
 
 // Cria nova sessão do WhatsApp
-async function createSession(sessionId, phone) {
+async function createSession(sessionId, webhookUrl) {
   if (sessions.has(sessionId)) {
     console.log(`[Session] ${sessionId} já existe`);
     return sessions.get(sessionId);
@@ -57,22 +56,18 @@ async function createSession(sessionId, phone) {
 
   console.log(`[Session] Criando sessão: ${sessionId}`);
 
+  const targetWebhook = webhookUrl || WEBHOOK_URL;
+
   try {
     const client = await venom.create(
       sessionId,
-      // Callback do QR Code
       (base64Qr, asciiQR) => {
         console.log(`[QR] Novo QR code para ${sessionId}`);
-        sendWebhook('qr', phone, { 
-          qr_code: base64Qr,
-          session_id: sessionId 
-        });
+        sendWebhook('qr', sessionId, { qrCode: base64Qr });
       },
-      // Callback de status
       (statusSession) => {
         console.log(`[Status] ${sessionId}: ${statusSession}`);
       },
-      // Opções
       {
         headless: 'new',
         useChrome: false,
@@ -93,28 +88,21 @@ async function createSession(sessionId, phone) {
       }
     );
 
-    // Eventos da sessão
     client.onStateChange((state) => {
       console.log(`[State] ${sessionId}: ${state}`);
       
       if (state === 'CONNECTED') {
-        sendWebhook('connected', phone, { session_id: sessionId });
+        sendWebhook('connected', sessionId, {});
       } else if (state === 'DISCONNECTED' || state === 'CONFLICT') {
-        sendWebhook('disconnected', phone, { 
-          session_id: sessionId,
-          reason: state 
-        });
+        sendWebhook('disconnected', sessionId, { reason: state });
         sessions.delete(sessionId);
       }
     });
 
-    // Recebe mensagens
     client.onMessage(async (message) => {
       console.log(`[Message] De ${message.from}: ${message.body?.substring(0, 50)}...`);
       
-      // Monta dados da mensagem
       const messageData = {
-        session_id: sessionId,
         message_id: message.id,
         from: message.from,
         to: message.to,
@@ -125,7 +113,6 @@ async function createSession(sessionId, phone) {
         timestamp: message.timestamp
       };
 
-      // Se for mídia, pega a URL
       if (message.isMedia || message.isMMS) {
         try {
           const buffer = await client.decryptFile(message);
@@ -137,13 +124,13 @@ async function createSession(sessionId, phone) {
         }
       }
 
-      sendWebhook('message', phone, messageData);
+      sendWebhook('message', sessionId, messageData);
     });
 
-    sessions.set(sessionId, { client, phone });
+    sessions.set(sessionId, { client, webhookUrl: targetWebhook });
     console.log(`[Session] ${sessionId} criada com sucesso`);
     
-    return { client, phone };
+    return { client, webhookUrl: targetWebhook };
 
   } catch (error) {
     console.error(`[Session] Erro ao criar ${sessionId}:`, error.message);
@@ -153,7 +140,6 @@ async function createSession(sessionId, phone) {
 
 // ==================== ROTAS ====================
 
-// Health check
 app.get('/', (req, res) => {
   res.json({ 
     status: 'ok', 
@@ -163,11 +149,10 @@ app.get('/', (req, res) => {
   });
 });
 
-// Health check detalhado
 app.get('/health', (req, res) => {
   const sessionList = [];
   sessions.forEach((value, key) => {
-    sessionList.push({ id: key, phone: value.phone });
+    sessionList.push({ sessionId: key });
   });
   
   res.json({ 
@@ -180,31 +165,27 @@ app.get('/health', (req, res) => {
 
 // Inicia nova sessão
 app.post('/session/start', authenticate, async (req, res) => {
-  const { phone, user_id } = req.body;
+  const { sessionId, webhookUrl } = req.body;
   
-  if (!phone) {
-    return res.status(400).json({ error: 'Phone é obrigatório' });
+  if (!sessionId) {
+    return res.status(400).json({ error: 'sessionId é obrigatório' });
   }
 
-  const sessionId = `keepy_${user_id || phone}`;
-  
   try {
-    // Não bloqueia esperando a sessão ser criada completamente
-    createSession(sessionId, phone).catch(err => {
+    createSession(sessionId, webhookUrl).catch(err => {
       console.error('[Session] Erro em background:', err.message);
     });
     
     res.json({ 
       success: true, 
       message: 'Sessão iniciando, aguarde o QR code',
-      session_id: sessionId 
+      sessionId: sessionId 
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Status da sessão
 app.get('/session/:sessionId/status', authenticate, (req, res) => {
   const { sessionId } = req.params;
   const session = sessions.get(sessionId);
@@ -216,11 +197,10 @@ app.get('/session/:sessionId/status', authenticate, (req, res) => {
   res.json({ 
     exists: true, 
     status: 'active',
-    phone: session.phone 
+    sessionId: sessionId 
   });
 });
 
-// Encerra sessão
 app.post('/session/:sessionId/logout', authenticate, async (req, res) => {
   const { sessionId } = req.params;
   const session = sessions.get(sessionId);
@@ -240,28 +220,20 @@ app.post('/session/:sessionId/logout', authenticate, async (req, res) => {
   }
 });
 
-// Envia mensagem de texto
 app.post('/message/send', authenticate, async (req, res) => {
-  const { session_id, phone, to, message } = req.body;
+  const { sessionId, to, message } = req.body;
   
-  // Encontra sessão pelo ID ou phone
-  let session;
-  if (session_id) {
-    session = sessions.get(session_id);
-  } else if (phone) {
-    sessions.forEach((value, key) => {
-      if (value.phone === phone) session = value;
-    });
+  if (!sessionId) {
+    return res.status(400).json({ error: 'sessionId é obrigatório' });
   }
 
+  const session = sessions.get(sessionId);
   if (!session) {
     return res.status(404).json({ error: 'Sessão não encontrada' });
   }
 
   try {
-    // Formata número (adiciona @c.us se necessário)
     const chatId = to.includes('@') ? to : `${to}@c.us`;
-    
     const result = await session.client.sendText(chatId, message);
     
     res.json({ 
@@ -274,18 +246,20 @@ app.post('/message/send', authenticate, async (req, res) => {
   }
 });
 
-// Envia arquivo/imagem
 app.post('/message/send-file', authenticate, async (req, res) => {
-  const { session_id, to, file_base64, filename, caption } = req.body;
+  const { sessionId, to, file_base64, filename, caption } = req.body;
   
-  const session = sessions.get(session_id);
+  if (!sessionId) {
+    return res.status(400).json({ error: 'sessionId é obrigatório' });
+  }
+
+  const session = sessions.get(sessionId);
   if (!session) {
     return res.status(404).json({ error: 'Sessão não encontrada' });
   }
 
   try {
     const chatId = to.includes('@') ? to : `${to}@c.us`;
-    
     const result = await session.client.sendFileFromBase64(
       chatId, 
       file_base64, 
@@ -302,14 +276,10 @@ app.post('/message/send-file', authenticate, async (req, res) => {
   }
 });
 
-// Lista sessões ativas
 app.get('/sessions', authenticate, (req, res) => {
   const sessionList = [];
   sessions.forEach((value, key) => {
-    sessionList.push({ 
-      session_id: key, 
-      phone: value.phone 
-    });
+    sessionList.push({ sessionId: key });
   });
   
   res.json({ sessions: sessionList });
